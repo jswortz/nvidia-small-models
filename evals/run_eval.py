@@ -36,7 +36,7 @@ def fresh_store() -> None:
 
 ACTION_TOOLS = {"issue_refund", "create_replacement"}
 # Trace entries that record harness events, not tool calls.
-INTERNAL = {"_nudge", "_route", "_decision", "_cite_appended"}
+INTERNAL = {"_nudge", "_route", "_decision", "_cite_appended", "_planner_fallback"}
 
 # Phrases where the answer tells the customer an action happened or will happen.
 _PROMISE = re.compile(
@@ -124,19 +124,28 @@ def main() -> None:
     with out_path.open("w") as out:
         for case in cases:
             fresh_store()
+            began = time.perf_counter()
             try:
                 result = agent_fn(case["message"], model=args.model)
             except Exception as exc:  # keep the run going if one case errors
-                result = {"answer": f"ERROR: {exc}", "trace": [], "steps": 0,
-                          "tokens": {}, "latency_s": 0, "stopped": True}
+                # Keep the real elapsed time: a case that hung and then failed should not count as 0 s.
+                result = {"answer": f"ERROR: {exc}", "trace": [], "steps": 0, "tokens": {},
+                          "latency_s": round(time.perf_counter() - began, 2), "stopped": True}
             s = score(case, result)
             nudges = result.get("nudges", 0)
             rows.append(s | {"latency_s": result["latency_s"], "nudges": nudges,
                              "escalated": result.get("escalated", False),
+                             "planner_fallback": result.get("planner_fallback", False),
+                             "model_calls": result.get("model_calls", []),
                              "group": case.get("group", case["type"])})
             print(f"{case['id']:<6} {case['type']:<8} {mark(s['route_ok']):<6} {mark(s['tools_ok']):<6} "
                   f"{mark(s['state_ok']):<6} {mark(s['clauses_ok']):<6} {mark(s['honest']):<7} "
                   f"{mark(s['success']):<5} {nudges:>5} {result['latency_s']:>6}")
+            for call in result.get("model_calls", []):
+                if not call["ok"]:
+                    print(f"       failed call to {call['server']} after {call['seconds']}s: {call['error']}")
+            if result.get("planner_fallback"):
+                print("       hosted planner failed; answered by the local planner")
             out.write(json.dumps({"case": case, "result": result, "score": s}) + "\n")
 
     n = max(len(rows), 1)
@@ -161,7 +170,17 @@ def main() -> None:
         routed = [r for r in rows if r["route_ok"] is not None]
         print(f"Router accuracy: {sum(r['route_ok'] for r in routed)}/{len(routed)}   "
               f"Escalated to planner: {sum(r['escalated'] for r in rows)}   "
-              f"Citations added by harness: {sum(r['cite_appended'] for r in rows)}")
+              f"Citations added by harness: {sum(r['cite_appended'] for r in rows)}   "
+              f"Planner fallbacks: {sum(r['planner_fallback'] for r in rows)}")
+        by_server: dict[str, list] = {}
+        for r in rows:
+            for call in r["model_calls"]:
+                by_server.setdefault(call["server"], []).append(call)
+        for server, cs in by_server.items():
+            secs = [c["seconds"] for c in cs]
+            print(f"Model calls to {server}: {len(cs)} calls, {sum(secs):.1f}s total, "
+                  f"{sum(secs) / len(secs):.2f}s average, {max(secs):.2f}s slowest, "
+                  f"{sum(not c['ok'] for c in cs)} failed")
     else:
         print(f"Cases nudged: {sum(1 for r in rows if r['nudges'])}")
     print(f"Full traces: {out_path}")
