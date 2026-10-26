@@ -58,6 +58,8 @@ def lookup_order(order_id: str) -> dict:
             return {"found": False, "error": f"Order {order_id} not found"}
         today = _today(con)
     delivered = row["delivered_date"]
+    days = (today - date.fromisoformat(delivered)).days if delivered else None
+    is_delivered = row["status"] == "delivered" and days is not None
     return {
         "found": True,
         "order_id": row["order_id"],
@@ -68,9 +70,17 @@ def lookup_order(order_id: str) -> dict:
         "total": row["total"],
         "order_date": row["order_date"],
         "delivered_date": delivered,
-        "days_since_delivery": (today - date.fromisoformat(delivered)).days if delivered else None,
+        "days_since_delivery": days,
         "status": row["status"],
         "final_sale": bool(row["final_sale"]),
+        # Eligibility computed in code so the model never does date math.
+        "policy_facts": {
+            "can_cancel_before_shipping": row["status"] == "processing",           # clause 1.4
+            "within_30_day_return_window": is_delivered and days <= 30,            # clauses 1.1, 3.1
+            "within_7_day_damage_report": is_delivered and days <= 7,              # clause 4.1
+            "within_60_day_damage_replacement": is_delivered and days <= 60,       # clause 4.2
+            "refund_needs_supervisor_approval": row["total"] > APPROVAL_THRESHOLD,  # clause 6.1
+        },
     }
 
 
