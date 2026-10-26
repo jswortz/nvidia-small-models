@@ -27,16 +27,27 @@ ROUTER_PROMPT = """/no_think Classify the customer support message. Reply with J
 
 intent, pick one:
 - order_status: asks where an order is or what its status is
-- policy_question: a general question about returns, refunds, shipping, or warranty, with no action requested on an order
-- cancel: wants to cancel an order
-- refund: wants their money back or wants to return an item
+- policy_question: asks how something works (return windows, refund timing, shipping costs, warranty) without asking you to act on a specific order. "How long until a refund shows up?" is a policy_question.
+- cancel: wants to stop an order before it is delivered, or uses the word cancel
+- refund: wants their money back, or wants to return or send back an item. "Return order 2033" is a refund, not a cancel.
 - replacement: wants a replacement, an exchange, or a swap to a different model
 - other: anything else
 
 order_id: the order number as a string, or null if none is given
-damaged: true only if the item arrived damaged, broken, cracked, or defective
+damaged: true if the item arrived damaged, broken, cracked, or defective, or is not working properly (stopped working, will not turn on, dead pixels, strange noises or smells). false if the customer says it works.
 photo_provided: true only if the customer says they attached or sent a photo
-new_product: the different product or model they want instead, in their words, or null"""
+new_product: the different product or model they want instead, in their words, or null
+
+Examples (message -> intent, damaged):
+- "I'd like to send back the kettle from order 2041, it's fine but we don't use it" -> refund, false
+- "Cancel order 2077, I ordered it by mistake" -> cancel, false
+- "The lamp from order 2090 won't turn on anymore" -> refund, true
+- "My headphones from order 2012 crackle and cut out" -> replacement, true
+- "When will my refund hit my account?" -> policy_question, false
+- "Do you price match?" -> other, false"""
+
+# Example order numbers above (2012 to 2090) are outside the store's 1000s range on purpose,
+# so the prompt never hints at a real test order. tests/test_router.py checks this.
 
 _ORDER_ID = re.compile(r"\b(\d{4})\b")
 _JSON = re.compile(r"\{.*\}", re.DOTALL)
