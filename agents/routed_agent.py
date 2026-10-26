@@ -6,6 +6,7 @@
     4. Code runs the action, if any.
     5. Writer (Nano) explains the decision to the customer and cites the clauses.
     Requests the router cannot classify go to the planner (the Phase 2 agent).
+    A message naming two or more real orders runs steps 1 to 4 once per order, then one reply covers all.
 
 Run one message from /workspace:
     python -m agents.routed_agent "My blender from order 1187 arrived cracked..."
@@ -40,7 +41,22 @@ Rules:
 4. If "outcome" is "need_info", ask for exactly what is missing.
 5. If "outcome" is "info" and "retrieved_policy" is given, answer from it and cite the clause that answers the question."""
 
+MULTI_WRITER_PROMPT = WRITER_PROMPT.replace("1. Two to four sentences", "1. Two to six sentences") + """
+6. The message covers several orders. "requests" holds one decision per order. Cover every order, in the order given, and name each order number. Each request's rules 2 to 5 apply only to that order.
+7. Say nothing the requests and clauses do not state: no claims about whether an action can be undone, how long it takes, or what happens next."""
+
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
+# A four digit number not preceded by "$", so prices such as $1299 are not read as orders.
+_ORDER_NUMBER = re.compile(r"(?<!\$)\b(\d{4})\b")
+
+
+def find_orders(message: str) -> list[str]:
+    """Distinct order numbers in the message that exist in the store, in the order they appear."""
+    seen: list[str] = []
+    for number in _ORDER_NUMBER.findall(message):
+        if number not in seen and json.loads(call_tool("lookup_order", {"order_id": number})).get("found"):
+            seen.append(number)
+    return seen
 
 
 def _client(base_url: str | None = None) -> OpenAI:
@@ -63,9 +79,90 @@ def write_reply(client, model: str, context: dict) -> tuple[str, dict]:
     return _THINK.sub("", resp.choices[0].message.content or "").strip(), usage
 
 
+def run_multi(user_message: str, order_ids: list[str], client: OpenAI, model: str) -> dict:
+    """One message, several orders: route, decide, and act once per order, then write one reply.
+
+    The planner is never called here. It sees the whole message and could act on every order
+    again, so a request the engine cannot place is answered by asking the customer instead.
+    """
+    start = time.perf_counter()
+    tokens = {"prompt": 0, "completion": 0}
+    trace: list[dict] = []
+
+    def tool(name: str, args: dict) -> dict:
+        result = json.loads(call_tool(name, args))
+        trace.append({"step": len(trace) + 1, "tool": name, "arguments": json.dumps(args), "result": result})
+        return result
+
+    routes, decisions, requests, all_clauses = [], [], [], []
+    for order_id in order_ids:
+        # Same router, same prompt: the message is passed whole with a note naming the order to classify.
+        route, usage = router.classify(f"{user_message}\n\n(Classify only the request about order {order_id}.)",
+                                       client, model)
+        _add(tokens, usage)
+        route["order_id"] = order_id  # Code found this order; the model does not get to change it.
+        trace.append({"step": len(trace) + 1, "tool": "_route", "arguments": order_id, "result": route})
+
+        order = tool("lookup_order", {"order_id": order_id})
+        product = None
+        if route["intent"] == "replacement" and route["new_product"]:
+            hits = tool("search_products", {"query": route["new_product"]})["results"]
+            product = hits[0] if hits else None
+
+        decision = policy_engine.decide(route, order, product)
+        if decision.outcome == "escalate":
+            decision = policy_engine.Decision(
+                "need_info", f"The request about order {order_id} is not one the store systems can handle. "
+                             "Ask the customer what they need for this order.")
+        trace.append({"step": len(trace) + 1, "tool": "_decision", "arguments": order_id, "result": asdict(decision)})
+
+        action_result = tool(decision.action, decision.action_args) if decision.outcome == "act" else None
+        clause_text = []
+        for clause_id in decision.clauses:
+            clause = policy_search.get_clause(clause_id)
+            trace.append({"step": len(trace) + 1, "tool": "get_clause", "arguments": clause_id, "result": clause})
+            clause_text.append({k: clause.get(k) for k in ("clause_id", "title", "text")})
+            if clause_id not in all_clauses:
+                all_clauses.append(clause_id)
+
+        routes.append(route)
+        decisions.append(asdict(decision))
+        requests.append({
+            "order": {k: order.get(k) for k in ("order_id", "product_name", "status", "delivered_date")},
+            "request": route["intent"],
+            "outcome": decision.outcome,
+            "decision": decision.reason,
+            "clauses": clause_text,
+            "action_result": action_result,
+        })
+
+    resp = client.chat.completions.create(
+        model=model, temperature=0, max_tokens=400,
+        messages=[{"role": "system", "content": MULTI_WRITER_PROMPT},
+                  {"role": "user", "content": json.dumps({"customer_message": user_message,
+                                                          "requests": requests}, indent=2)}])
+    if resp.usage:
+        _add(tokens, {"prompt": resp.usage.prompt_tokens, "completion": resp.usage.completion_tokens})
+    answer = _THINK.sub("", resp.choices[0].message.content or "").strip()
+
+    missing = [c for c in all_clauses if c not in answer]
+    if missing:
+        answer = f"{answer} (policy {', '.join(missing)})"
+        trace.append({"step": len(trace) + 1, "tool": "_cite_appended", "arguments": "", "result": {"clauses": missing}})
+
+    # "route" and "decision" keep the single-order shape for the eval; the full lists sit beside them.
+    return {"answer": answer, "trace": trace, "steps": 2, "tokens": tokens, "nudges": 0,
+            "latency_s": round(time.perf_counter() - start, 2), "stopped": False,
+            "route": routes[0], "decision": decisions[0], "routes": routes, "decisions": decisions,
+            "escalated": False, "multi_order": True}
+
+
 def run_routed(user_message: str, client: OpenAI | None = None, model: str = MODEL,
                planner_client: OpenAI | None = None) -> dict:
     client = client or _client()
+    order_ids = find_orders(user_message)
+    if len(order_ids) >= 2:
+        return run_multi(user_message, order_ids, client, model)
     start = time.perf_counter()
     tokens = {"prompt": 0, "completion": 0}
     trace: list[dict] = []
