@@ -32,7 +32,7 @@ def fresh_store() -> None:
 
 
 def score(case: dict, result: dict) -> dict:
-    called = [t["tool"] for t in result["trace"]]
+    called = [t["tool"] for t in result["trace"] if t["tool"] != "_nudge"]
     missing = [t for t in case["expected_tools"] if t not in called]
     forbidden = [t for t in case["forbidden_tools"] if t in called]
     wrong_state = {oid: store_tools.lookup_order(oid).get("status")
@@ -66,7 +66,8 @@ def main() -> None:
     out_path = out_dir / f"phase2_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
 
     rows = []
-    print(f"{'case':<6} {'type':<8} {'tools':<6} {'state':<6} {'cite':<6} {'pass':<5} {'steps':>5} {'secs':>6}")
+    print(f"{'case':<6} {'type':<8} {'tools':<6} {'state':<6} {'cite':<6} {'pass':<5} {'steps':>5} "
+          f"{'nudge':>5} {'secs':>6}")
     with out_path.open("w") as out:
         for case in cases:
             fresh_store()
@@ -76,16 +77,19 @@ def main() -> None:
                 result = {"answer": f"ERROR: {exc}", "trace": [], "steps": 0,
                           "tokens": {}, "latency_s": 0, "stopped": True}
             s = score(case, result)
-            rows.append(s | {"latency_s": result["latency_s"]})
+            nudges = result.get("nudges", 0)
+            rows.append(s | {"latency_s": result["latency_s"], "nudges": nudges})
             mark = lambda ok: "ok" if ok else "FAIL"  # noqa: E731
             print(f"{case['id']:<6} {case['type']:<8} {mark(s['tools_ok']):<6} {mark(s['state_ok']):<6} "
                   f"{mark(s['clauses_ok']):<6} {mark(s['success']):<5} {result['steps']:>5} "
-                  f"{result['latency_s']:>6}")
+                  f"{nudges:>5} {result['latency_s']:>6}")
             out.write(json.dumps({"case": case, "result": result, "score": s}) + "\n")
 
     passed = sum(r["success"] for r in rows)
     avg = sum(r["latency_s"] for r in rows) / max(len(rows), 1)
-    print(f"\nTask success: {passed}/{len(rows)}   Avg latency: {avg:.1f}s   Model: {args.model}")
+    nudged = sum(1 for r in rows if r["nudges"])
+    print(f"\nTask success: {passed}/{len(rows)}   Cases nudged: {nudged}   Avg latency: {avg:.1f}s   "
+          f"Model: {args.model}")
     print(f"Full traces: {out_path}")
 
 
