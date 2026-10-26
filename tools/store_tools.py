@@ -149,9 +149,12 @@ def create_replacement(order_id: str, reason: str, new_product_id: str | None = 
     }
 
 
+_FILLER = {"the", "a", "an", "one", "model", "for", "to", "my", "instead", "different", "new", "other"}
+
+
 def search_products(query: str, category: str | None = None, limit: int = 5) -> dict:
     """Find products by name keywords, for example '1200W blender'."""
-    terms = re.findall(r"[a-z0-9]+", query.lower())
+    terms = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if t not in _FILLER]
     sql, params = "SELECT * FROM products", ()
     if category:
         sql, params = sql + " WHERE category = ?", (category.lower(),)

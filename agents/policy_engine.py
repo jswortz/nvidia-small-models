@@ -73,25 +73,27 @@ def decide(route: dict, order: dict | None, product: dict | None = None) -> Deci
     if intent == "replacement":
         if status != "delivered":
             return Decision("decline", "Only delivered orders can be replaced.")
-        if route.get("new_product") and product is None:
-            return Decision("need_info", "The requested model could not be found. Ask which product they want.")
-        if product is not None and product["category"] != order["category"]:
-            return Decision("decline", "A swap must be for a product in the same category.", ["4.2"])
-        args = {"order_id": order["order_id"]}
-        if product is not None:
-            args["new_product_id"] = product["product_id"]
+        # Eligibility first: no point asking which model if the swap is not allowed at all.
         if route["damaged"]:
             if not facts["within_60_day_damage_replacement"]:
                 return Decision("decline", "It has been more than 60 days, so this goes through the manufacturer warranty.", ["5.1"])
             if not facts["within_7_day_damage_report"] and not route["photo_provided"]:
                 return Decision("need_info", "Damage claims after 7 days need a photo. Ask for one.", ["4.3"])
-            reason = "The item arrived damaged and is within the 60 day replacement window."
-            return Decision("act", reason, ["4.2"], "create_replacement", args | {"reason": f"{reason} (policy 4.2)"})
-        if order["final_sale"]:
-            return Decision("decline", "This item is final sale and arrived undamaged, so it cannot be exchanged.", ["1.3"])
-        if facts["within_30_day_return_window"]:
-            reason = "The item is within the 30 day exchange window."
-            return Decision("act", reason, ["3.1"], "create_replacement", args | {"reason": f"{reason} (policy 3.1)"})
-        return Decision("decline", "The item is past the 30 day exchange window and was not damaged.", ["3.1"])
+            clause, reason = "4.2", "The item arrived damaged and is within the 60 day replacement window."
+        else:
+            if order["final_sale"]:
+                return Decision("decline", "This item is final sale and arrived undamaged, so it cannot be exchanged.", ["1.3"])
+            if not facts["within_30_day_return_window"]:
+                return Decision("decline", "The item is past the 30 day exchange window and was not damaged.", ["3.1"])
+            clause, reason = "3.1", "The item is within the 30 day exchange window."
+        # Then the product they asked for.
+        if route.get("new_product") and product is None:
+            return Decision("need_info", "The requested model could not be found. Ask which product they want.")
+        if product is not None and product["category"] != order["category"]:
+            return Decision("decline", "A swap must be for a product in the same category.", [clause])
+        args = {"order_id": order["order_id"], "reason": f"{reason} (policy {clause})"}
+        if product is not None:
+            args["new_product_id"] = product["product_id"]
+        return Decision("act", reason, [clause], "create_replacement", args)
 
     return Decision("escalate", "Unhandled request. Hand it to the planner.")

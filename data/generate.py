@@ -115,7 +115,7 @@ Original shipping costs are not refundable, except when the item arrived damaged
 ## 3. Exchanges
 
 ### 3.1 Exchanges within the return window
-Within 30 days of delivery, an item can be exchanged for a different size, color, or model. If the new item costs more, the customer pays the price difference. If it costs less, we refund the difference.
+Within 30 days of delivery, an item can be exchanged for a different size, color, or model in the same category. If the new item costs more, the customer pays the price difference. If it costs less, we refund the difference.
 
 ## 4. Damaged or defective items
 

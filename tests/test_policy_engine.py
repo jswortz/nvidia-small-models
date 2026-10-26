@@ -69,6 +69,13 @@ check("damage refund after 7 days offers a replacement instead",
 check("cross-category swap is declined",
       decide(route("replacement", "1187", damaged=True, photo=True, new_product="TV"), lookup_order("1187"), tv55),
       "decline", ["4.2"])
+earbuds_order = lookup_order("1026")  # electronics, delivered 10 days ago, not final sale
+vacuum = search_products("robot vacuum")["results"][0]
+check("non-damaged cross-category exchange cites the exchange clause",
+      decide(route("replacement", "1026", new_product="robot vacuum"), earbuds_order, vacuum), "decline", ["3.1"])
+check("final sale exchange is declined before asking which model",
+      decide(route("replacement", "1047", new_product="a different one"), lookup_order("1047"), None),
+      "decline", ["1.3"])
 check("final sale item that arrived damaged can still be refunded within 7 days",
       decide(route("refund", "1150", damaged=True), lookup_order("1150")), "act", ["4.1"], "issue_refund")
 check("missing order number asks for it", decide(route("refund"), None), "need_info")

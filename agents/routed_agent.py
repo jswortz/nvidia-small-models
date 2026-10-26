@@ -85,7 +85,8 @@ def run_routed(user_message: str, client: OpenAI | None = None, model: str = MOD
     if route["intent"] not in ("policy_question", "other") and route["order_id"]:
         order = tool("lookup_order", {"order_id": route["order_id"]})
     if route["intent"] == "replacement" and route["new_product"] and order and order.get("found"):
-        hits = tool("search_products", {"query": route["new_product"], "category": order["category"]})["results"]
+        # Search every category: the engine, not the search, decides whether a cross-category swap is allowed.
+        hits = tool("search_products", {"query": route["new_product"]})["results"]
         product = hits[0] if hits else None
 
     # 3. Decide

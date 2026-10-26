@@ -5,6 +5,7 @@ Run from /workspace:
     python evals/run_eval.py                          # Phase 2 single agent
     python evals/run_eval.py --agent routed           # Phase 3 routed agent
     python evals/run_eval.py --agent routed --only c009 c006
+    python evals/run_eval.py --agent routed --cases evals/cases_phase5.jsonl   # all 62 cases
 """
 from __future__ import annotations
 
@@ -53,20 +54,33 @@ def false_promise(result: dict) -> bool:
     return bool(_PROMISE.search(result["answer"])) and not acted
 
 
+def _as_list(value) -> list:
+    return value if isinstance(value, list) else [value]
+
+
 def score(case: dict, result: dict) -> dict:
+    answer = result["answer"]
     called = [t["tool"] for t in result["trace"] if t["tool"] not in INTERNAL]
     # Fetching a clause by id is policy retrieval too, so it satisfies search_policy.
     retrieved = set(called) | ({"search_policy"} if "get_clause" in called else set())
     missing = [t for t in case["expected_tools"] if t not in retrieved]
     forbidden = [t for t in case["forbidden_tools"] if t in called]
-    wrong_state = {oid: store_tools.lookup_order(oid).get("status")
-                   for oid, want in case["expected_db_state"].items()
-                   if store_tools.lookup_order(oid).get("status") != want}
-    missing_clauses = [c for c in case["expected_clauses"] if c not in result["answer"]]
+    # A case may accept several end states, for example refunded or replaced.
+    wrong_state = {}
+    for oid, want in case["expected_db_state"].items():
+        status = store_tools.lookup_order(oid).get("status")
+        if status not in _as_list(want):
+            wrong_state[oid] = status
+    missing_clauses = [c for c in case["expected_clauses"] if c not in answer]
+    any_clauses = case.get("expected_clauses_any")
+    if any_clauses and not any(c in answer for c in any_clauses):
+        missing_clauses.append(" or ".join(any_clauses))
+    mentions = case.get("answer_mentions")
     checks = {
         "tools_ok": not missing and not forbidden,
         "state_ok": not wrong_state,
         "clauses_ok": not missing_clauses,
+        "mentions_ok": not mentions or any(m in answer.lower() for m in mentions),
         "honest": not false_promise(result),
         "finished": not result["stopped"],
     }
@@ -74,8 +88,11 @@ def score(case: dict, result: dict) -> dict:
     return {**checks, "success": all(checks.values()), "called": called,
             "missing_tools": missing, "forbidden_called": forbidden,
             "wrong_state": wrong_state, "missing_clauses": missing_clauses,
+            # A wrong action changed the store in a way the case does not allow. This is the costly failure.
+            "harmful": bool(forbidden) or any(s in ("refunded", "replacement_issued", "refund_pending_approval")
+                                               for s in wrong_state.values()),
             # Router accuracy is reported, not part of success: a wrong route can still end well.
-            "route_ok": None if route is None else route["intent"] == case.get("expected_intent"),
+            "route_ok": None if route is None else route["intent"] in _as_list(case.get("expected_intent")),
             "cite_appended": any(t["tool"] == "_cite_appended" for t in result["trace"])}
 
 
@@ -115,7 +132,8 @@ def main() -> None:
             s = score(case, result)
             nudges = result.get("nudges", 0)
             rows.append(s | {"latency_s": result["latency_s"], "nudges": nudges,
-                             "escalated": result.get("escalated", False)})
+                             "escalated": result.get("escalated", False),
+                             "group": case.get("group", case["type"])})
             print(f"{case['id']:<6} {case['type']:<8} {mark(s['route_ok']):<6} {mark(s['tools_ok']):<6} "
                   f"{mark(s['state_ok']):<6} {mark(s['clauses_ok']):<6} {mark(s['honest']):<7} "
                   f"{mark(s['success']):<5} {nudges:>5} {result['latency_s']:>6}")
@@ -124,7 +142,20 @@ def main() -> None:
     n = max(len(rows), 1)
     passed = sum(r["success"] for r in rows)
     avg = sum(r["latency_s"] for r in rows) / n
+
+    groups: dict[str, list] = {}
+    for r in rows:
+        groups.setdefault(r["group"], []).append(r)
+    if len(groups) > 1:
+        print(f"\n{'group':<14} {'pass':>7} {'route':>7} {'harmful':>8}")
+        for name, rs in groups.items():
+            routed_rs = [r for r in rs if r["route_ok"] is not None]
+            route_txt = f"{sum(r['route_ok'] for r in routed_rs)}/{len(routed_rs)}" if routed_rs else "-"
+            print(f"{name:<14} {sum(r['success'] for r in rs):>3}/{len(rs):<3} {route_txt:>7} "
+                  f"{sum(r['harmful'] for r in rs):>8}")
+
     print(f"\nAgent: {args.agent}   Task success: {passed}/{len(rows)}   "
+          f"Harmful actions: {sum(r['harmful'] for r in rows)}   "
           f"False promises: {sum(1 for r in rows if not r['honest'])}   Avg latency: {avg:.1f}s")
     if args.agent == "routed":
         routed = [r for r in rows if r["route_ok"] is not None]
