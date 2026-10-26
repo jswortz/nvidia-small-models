@@ -6,6 +6,7 @@ Run from /workspace:
     python evals/run_eval.py --agent routed           # Phase 3 routed agent
     python evals/run_eval.py --agent routed --only c009 c006
     python evals/run_eval.py --agent routed --cases evals/cases_phase5.jsonl   # all 62 cases
+    python evals/run_eval.py --agent routed --cases evals/cases_phase5.jsonl --profile   # plus NAT profiling
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -102,7 +104,16 @@ def main() -> None:
     parser.add_argument("--cases", type=Path, default=ROOT / "evals" / "cases_phase2.jsonl")
     parser.add_argument("--only", nargs="*", help="case ids to run")
     parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--profile", action="store_true",
+                        help="routed agent only: record NeMo Agent Toolkit events and report tokens and time per stage")
     args = parser.parse_args()
+    if args.profile:
+        from agents import nat_profiling
+        if args.agent != "routed":
+            parser.error("--profile instruments the routed agent's stages; use it with --agent routed")
+        if not nat_profiling.NAT_AVAILABLE:
+            parser.error("--profile needs NeMo Agent Toolkit: pip install 'nvidia-nat[profiler]==1.9.0'")
+    nat_steps: list[list] = []
 
     if args.agent == "routed":
         from agents.routed_agent import run_routed as agent_fn
@@ -125,12 +136,16 @@ def main() -> None:
         for case in cases:
             fresh_store()
             began = time.perf_counter()
-            try:
-                result = agent_fn(case["message"], model=args.model)
-            except Exception as exc:  # keep the run going if one case errors
-                # Keep the real elapsed time: a case that hung and then failed should not count as 0 s.
-                result = {"answer": f"ERROR: {exc}", "trace": [], "steps": 0, "tokens": {},
-                          "latency_s": round(time.perf_counter() - began, 2), "stopped": True}
+            # The collector only listens to NAT events; it does not change what the agent does or how it is scored.
+            with (nat_profiling.Collector(case["id"]) if args.profile else nullcontext()) as collector:
+                try:
+                    result = agent_fn(case["message"], model=args.model)
+                except Exception as exc:  # keep the run going if one case errors
+                    # Keep the real elapsed time: a case that hung and then failed should not count as 0 s.
+                    result = {"answer": f"ERROR: {exc}", "trace": [], "steps": 0, "tokens": {},
+                              "latency_s": round(time.perf_counter() - began, 2), "stopped": True}
+            if args.profile:
+                nat_steps.append(collector.steps)
             s = score(case, result)
             nudges = result.get("nudges", 0)
             rows.append(s | {"latency_s": result["latency_s"], "nudges": nudges,
@@ -184,6 +199,18 @@ def main() -> None:
     else:
         print(f"Cases nudged: {sum(1 for r in rows if r['nudges'])}")
     print(f"Full traces: {out_path}")
+
+    if args.profile:
+        nat_dir = out_path.with_suffix("")
+        nat_dir = nat_dir.with_name(nat_dir.name + "_nat")
+        stages = nat_profiling.profile(nat_steps, nat_dir)
+        print(f"\nNeMo Agent Toolkit profile, per stage ({len(nat_steps)} cases). Tokens and time are per case where the stage ran.")
+        print(f"{'stage':<8} {'cases':>5} {'LLM calls':>9} {'prompt tok':>10} {'compl tok':>9} "
+              f"{'avg ms':>9} {'p95 ms':>9} {'total s':>8}")
+        for r in stages:
+            print(f"{r['stage']:<8} {r['cases']:>5} {r['llm_calls']:>9} {r['avg_prompt_tokens']:>10} "
+                  f"{r['avg_completion_tokens']:>9} {r['avg_ms']:>9} {r['p95_ms']:>9} {r['total_s']:>8}")
+        print(f"NAT outputs (event CSV, latency intervals, bottleneck report): {nat_dir}")
 
 
 if __name__ == "__main__":

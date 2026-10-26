@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 from openai import OpenAI
 
 from agents import policy_engine, router
+from agents.nat_profiling import NatLLMClient, step
 from agents.single_agent import run_agent as run_planner
 from tools import policy_search
 from tools.registry import call_tool
@@ -133,33 +134,40 @@ def run_multi(user_message: str, order_ids: list[str], client: OpenAI, model: st
     routes, decisions, requests, all_clauses = [], [], [], []
     for order_id in order_ids:
         # Same router, same prompt: the message is passed whole with a note naming the order to classify.
-        route, usage = router.classify(f"{user_message}\n\n(Classify only the request about order {order_id}.)",
-                                       client, model)
+        with step("router"):
+            route, usage = router.classify(f"{user_message}\n\n(Classify only the request about order {order_id}.)",
+                                           client, model)
         _add(tokens, usage)
         route["order_id"] = order_id  # Code found this order; the model does not get to change it.
         trace.append({"step": len(trace) + 1, "tool": "_route", "arguments": order_id, "result": route})
 
-        order = tool("lookup_order", {"order_id": order_id})
-        product = None
-        if route["intent"] == "replacement" and route["new_product"]:
-            hits = tool("search_products", {"query": route["new_product"]})["results"]
-            product = hits[0] if hits else None
+        with step("lookup"):
+            order = tool("lookup_order", {"order_id": order_id})
+            product = None
+            if route["intent"] == "replacement" and route["new_product"]:
+                hits = tool("search_products", {"query": route["new_product"]})["results"]
+                product = hits[0] if hits else None
 
-        decision = policy_engine.decide(route, order, product)
+        with step("engine"):
+            decision = policy_engine.decide(route, order, product)
         if decision.outcome == "escalate":
             decision = policy_engine.Decision(
                 "need_info", f"The request about order {order_id} is not one the store systems can handle. "
                              "Ask the customer what they need for this order.")
         trace.append({"step": len(trace) + 1, "tool": "_decision", "arguments": order_id, "result": asdict(decision)})
 
-        action_result = tool(decision.action, decision.action_args) if decision.outcome == "act" else None
+        action_result = None
+        if decision.outcome == "act":
+            with step("action"):
+                action_result = tool(decision.action, decision.action_args)
         clause_text = []
-        for clause_id in decision.clauses:
-            clause = policy_search.get_clause(clause_id)
-            trace.append({"step": len(trace) + 1, "tool": "get_clause", "arguments": clause_id, "result": clause})
-            clause_text.append({k: clause.get(k) for k in ("clause_id", "title", "text")})
-            if clause_id not in all_clauses:
-                all_clauses.append(clause_id)
+        with step("lookup"):
+            for clause_id in decision.clauses:
+                clause = policy_search.get_clause(clause_id)
+                trace.append({"step": len(trace) + 1, "tool": "get_clause", "arguments": clause_id, "result": clause})
+                clause_text.append({k: clause.get(k) for k in ("clause_id", "title", "text")})
+                if clause_id not in all_clauses:
+                    all_clauses.append(clause_id)
 
         routes.append(route)
         decisions.append(asdict(decision))
@@ -172,19 +180,20 @@ def run_multi(user_message: str, order_ids: list[str], client: OpenAI, model: st
             "action_result": action_result,
         })
 
-    resp = client.chat.completions.create(
-        model=model, temperature=0, max_tokens=400,
-        messages=[{"role": "system", "content": MULTI_WRITER_PROMPT},
-                  {"role": "user", "content": json.dumps({"customer_message": user_message,
-                                                          "requests": requests}, indent=2)}])
-    if resp.usage:
-        _add(tokens, {"prompt": resp.usage.prompt_tokens, "completion": resp.usage.completion_tokens})
-    answer = _THINK.sub("", resp.choices[0].message.content or "").strip()
+    with step("writer"):
+        resp = client.chat.completions.create(
+            model=model, temperature=0, max_tokens=400,
+            messages=[{"role": "system", "content": MULTI_WRITER_PROMPT},
+                      {"role": "user", "content": json.dumps({"customer_message": user_message,
+                                                              "requests": requests}, indent=2)}])
+        if resp.usage:
+            _add(tokens, {"prompt": resp.usage.prompt_tokens, "completion": resp.usage.completion_tokens})
+        answer = _THINK.sub("", resp.choices[0].message.content or "").strip()
 
-    missing = [c for c in all_clauses if c not in answer]
-    if missing:
-        answer = f"{answer} (policy {', '.join(missing)})"
-        trace.append({"step": len(trace) + 1, "tool": "_cite_appended", "arguments": "", "result": {"clauses": missing}})
+        missing = [c for c in all_clauses if c not in answer]
+        if missing:
+            answer = f"{answer} (policy {', '.join(missing)})"
+            trace.append({"step": len(trace) + 1, "tool": "_cite_appended", "arguments": "", "result": {"clauses": missing}})
 
     # "route" and "decision" keep the single-order shape for the eval; the full lists sit beside them.
     return {"answer": answer, "trace": trace, "steps": 2, "tokens": tokens, "nudges": 0,
@@ -196,13 +205,16 @@ def run_multi(user_message: str, order_ids: list[str], client: OpenAI, model: st
 def run_routed(user_message: str, client: OpenAI | None = None, model: str = MODEL,
                planner_client: OpenAI | None = None) -> dict:
     calls: list[dict] = []
-    result = _run_routed(user_message, TimedClient(client or _client(), calls), model, planner_client, calls)
+    # NatLLMClient emits NAT profiler events; TimedClient keeps the per-call log in result["model_calls"].
+    result = _run_routed(user_message, TimedClient(NatLLMClient(client or _client()), calls), model,
+                         planner_client, calls)
     result["model_calls"] = calls
     return result
 
 
 def _run_routed(user_message: str, client, model: str, planner_client, calls: list[dict]) -> dict:
-    order_ids = find_orders(user_message)
+    with step("lookup"):
+        order_ids = find_orders(user_message)
     if len(order_ids) >= 2:
         return run_multi(user_message, order_ids, client, model)
     start = time.perf_counter()
@@ -215,61 +227,46 @@ def _run_routed(user_message: str, client, model: str, planner_client, calls: li
         return result
 
     # 1. Understand
-    route, usage = router.classify(user_message, client, model)
+    with step("router"):
+        route, usage = router.classify(user_message, client, model)
     _add(tokens, usage)
     trace.append({"step": 1, "tool": "_route", "arguments": "", "result": route})
 
     # 2. Gather facts
     order = product = None
-    if route["intent"] not in ("policy_question", "other") and route["order_id"]:
-        order = tool("lookup_order", {"order_id": route["order_id"]})
-    if route["intent"] == "replacement" and route["new_product"] and order and order.get("found"):
-        # Search every category: the engine, not the search, decides whether a cross-category swap is allowed.
-        hits = tool("search_products", {"query": route["new_product"]})["results"]
-        product = hits[0] if hits else None
+    with step("lookup"):
+        if route["intent"] not in ("policy_question", "other") and route["order_id"]:
+            order = tool("lookup_order", {"order_id": route["order_id"]})
+        if route["intent"] == "replacement" and route["new_product"] and order and order.get("found"):
+            # Search every category: the engine, not the search, decides whether a cross-category swap is allowed.
+            hits = tool("search_products", {"query": route["new_product"]})["results"]
+            product = hits[0] if hits else None
 
     # 3. Decide
-    decision = policy_engine.decide(route, order, product)
+    with step("engine"):
+        decision = policy_engine.decide(route, order, product)
     trace.append({"step": len(trace) + 1, "tool": "_decision", "arguments": "", "result": asdict(decision)})
 
     if decision.outcome == "escalate":
-        hosted = planner_client or (_client(PLANNER_BASE_URL) if PLANNER_BASE_URL else None)
-        if hosted is None:
-            result = run_planner(user_message, client=client, model=PLANNER_MODEL)
-        else:
-            result = run_planner(user_message, client=TimedClient(hosted, calls), model=PLANNER_MODEL)
-        fallback = False
-        if hosted is not None and result.get("error"):
-            acted = any(t["tool"] in ACTION_TOOLS and t["result"].get("ok") for t in result["trace"])
-            # Retry on the local model only if the hosted planner changed nothing in the store.
-            if not acted:
-                fallback = True
-                first = result
-                result = run_planner(user_message, client=client, model=model)
-                result["trace"] = first["trace"] + [{"step": 0, "tool": "_planner_fallback", "arguments": "",
-                                                     "result": {"error": first["error"]}}] + result["trace"]
-                result["nudges"] += first["nudges"]
-                for k in ("prompt", "completion"):
-                    result["tokens"][k] += first["tokens"][k]
-        result["trace"] = trace + result["trace"]
-        result["route"] = route
-        result["escalated"] = True
-        result["planner_fallback"] = fallback
-        result["latency_s"] = round(time.perf_counter() - start, 2)
-        return result
+        with step("planner"):
+            return _escalate(user_message, client, model, planner_client, calls, trace, route, start)
 
     # 4. Act
-    action_result = tool(decision.action, decision.action_args) if decision.outcome == "act" else None
+    action_result = None
+    if decision.outcome == "act":
+        with step("action"):
+            action_result = tool(decision.action, decision.action_args)
 
     # 5. Explain, grounded in the actual policy text
     retrieved = None
-    if decision.outcome == "info" and route["intent"] == "policy_question":
-        retrieved = tool("search_policy", {"query": user_message})["results"]
     clause_text = []
-    for clause_id in decision.clauses:
-        clause = policy_search.get_clause(clause_id)
-        trace.append({"step": len(trace) + 1, "tool": "get_clause", "arguments": clause_id, "result": clause})
-        clause_text.append({k: clause.get(k) for k in ("clause_id", "title", "text")})
+    with step("lookup"):
+        if decision.outcome == "info" and route["intent"] == "policy_question":
+            retrieved = tool("search_policy", {"query": user_message})["results"]
+        for clause_id in decision.clauses:
+            clause = policy_search.get_clause(clause_id)
+            trace.append({"step": len(trace) + 1, "tool": "get_clause", "arguments": clause_id, "result": clause})
+            clause_text.append({k: clause.get(k) for k in ("clause_id", "title", "text")})
 
     context = {
         "customer_message": user_message,
@@ -281,18 +278,48 @@ def _run_routed(user_message: str, client, model: str, planner_client, calls: li
         if order and order.get("found") else None,
         "retrieved_policy": retrieved,
     }
-    answer, usage = write_reply(client, model, context)
-    _add(tokens, usage)
+    with step("writer"):
+        answer, usage = write_reply(client, model, context)
+        _add(tokens, usage)
 
-    # Guarantee every decided clause is cited, and record when the harness had to add one.
-    missing = [c for c in decision.clauses if c not in answer]
-    if missing:
-        answer = f"{answer} (policy {', '.join(missing)})"
-        trace.append({"step": len(trace) + 1, "tool": "_cite_appended", "arguments": "", "result": {"clauses": missing}})
+        # Guarantee every decided clause is cited, and record when the harness had to add one.
+        missing = [c for c in decision.clauses if c not in answer]
+        if missing:
+            answer = f"{answer} (policy {', '.join(missing)})"
+            trace.append({"step": len(trace) + 1, "tool": "_cite_appended", "arguments": "", "result": {"clauses": missing}})
 
     return {"answer": answer, "trace": trace, "steps": 2, "tokens": tokens, "nudges": 0,
             "latency_s": round(time.perf_counter() - start, 2), "stopped": False,
             "route": route, "decision": asdict(decision), "escalated": False}
+
+
+def _escalate(user_message: str, client, model: str, planner_client, calls: list[dict],
+              trace: list[dict], route: dict, start: float) -> dict:
+    """Hand the message to the planner (the Phase 2 agent), falling back to local Nano if a hosted call fails."""
+    hosted = planner_client or (_client(PLANNER_BASE_URL) if PLANNER_BASE_URL else None)
+    if hosted is None:
+        result = run_planner(user_message, client=client, model=PLANNER_MODEL)
+    else:
+        result = run_planner(user_message, client=TimedClient(NatLLMClient(hosted), calls), model=PLANNER_MODEL)
+    fallback = False
+    if hosted is not None and result.get("error"):
+        acted = any(t["tool"] in ACTION_TOOLS and t["result"].get("ok") for t in result["trace"])
+        # Retry on the local model only if the hosted planner changed nothing in the store.
+        if not acted:
+            fallback = True
+            first = result
+            result = run_planner(user_message, client=client, model=model)
+            result["trace"] = first["trace"] + [{"step": 0, "tool": "_planner_fallback", "arguments": "",
+                                                 "result": {"error": first["error"]}}] + result["trace"]
+            result["nudges"] += first["nudges"]
+            for k in ("prompt", "completion"):
+                result["tokens"][k] += first["tokens"][k]
+    result["trace"] = trace + result["trace"]
+    result["route"] = route
+    result["escalated"] = True
+    result["planner_fallback"] = fallback
+    result["latency_s"] = round(time.perf_counter() - start, 2)
+    return result
 
 
 if __name__ == "__main__":
