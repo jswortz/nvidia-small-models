@@ -84,10 +84,12 @@ def classify(message: str, client, model: str) -> tuple[dict, dict]:
     )
     usage = {"prompt": resp.usage.prompt_tokens, "completion": resp.usage.completion_tokens} if resp.usage \
         else {"prompt": 0, "completion": 0}
-    route = parse(resp.choices[0].message.content or "")
+    return backstop(parse(resp.choices[0].message.content or ""), message), usage
 
-    # Deterministic backstop: if the model missed an order number that is plainly there, take it.
+
+def backstop(route: dict, message: str) -> dict:
+    """Deterministic backstop: if the model missed an order number that is plainly there, take it."""
     if route["order_id"] is None and route["intent"] not in ("policy_question", "other"):
         found = _ORDER_ID.search(message)
         route["order_id"] = found.group(1) if found else None
-    return route, usage
+    return route
