@@ -19,6 +19,8 @@ import re
 import sys
 import time
 from dataclasses import asdict
+from types import SimpleNamespace
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
@@ -31,6 +33,10 @@ MODEL = os.getenv("AGENT_MODEL", "nvidia/NVIDIA-Nemotron-Nano-9B-v2")
 # Optional: point the planner at hosted Nemotron Super. Unset means the local model plans too.
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", MODEL)
 PLANNER_BASE_URL = os.getenv("PLANNER_BASE_URL")
+# The hosted free tier sometimes hangs or returns 500s. The SDK default is a 600 s timeout with 2 retries,
+# so cap it and fall back to the local model instead.
+PLANNER_TIMEOUT_S = float(os.getenv("PLANNER_TIMEOUT_S", "30"))
+ACTION_TOOLS = ("issue_refund", "create_replacement")
 
 WRITER_PROMPT = """/no_think You write the final reply to a retail customer. The decision has already been made by store systems. Do not change it.
 
@@ -60,8 +66,38 @@ def find_orders(message: str) -> list[str]:
 
 
 def _client(base_url: str | None = None) -> OpenAI:
-    return OpenAI(base_url=base_url or os.getenv("OPENAI_BASE_URL", "http://nim:8000/v1"),
-                  api_key=os.getenv("NVIDIA_API_KEY") if base_url else os.getenv("OPENAI_API_KEY", "local"))
+    if base_url:  # hosted planner
+        return OpenAI(base_url=base_url, api_key=os.getenv("NVIDIA_API_KEY"),
+                      timeout=PLANNER_TIMEOUT_S, max_retries=1)
+    return OpenAI(base_url=os.getenv("OPENAI_BASE_URL", "http://nim:8000/v1"),
+                  api_key=os.getenv("OPENAI_API_KEY", "local"))
+
+
+class TimedClient:
+    """Wraps a client and logs every chat call: server, model, seconds, and any error.
+
+    The log shows where a slow case spent its time, for example a hosted call that hung.
+    """
+
+    def __init__(self, client, log: list[dict]):
+        self._client, self._log = client, log
+        base_url = getattr(client, "base_url", None)
+        self.server = urlparse(str(base_url)).hostname if base_url else "unknown"
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        entry = {"server": self.server, "model": kwargs.get("model"), "ok": False}
+        start = time.perf_counter()
+        try:
+            resp = self._client.chat.completions.create(**kwargs)
+            entry["ok"] = True
+            return resp
+        except Exception as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"[:200]
+            raise
+        finally:
+            entry["seconds"] = round(time.perf_counter() - start, 2)
+            self._log.append(entry)
 
 
 def _add(tokens: dict, usage: dict) -> None:
@@ -159,7 +195,13 @@ def run_multi(user_message: str, order_ids: list[str], client: OpenAI, model: st
 
 def run_routed(user_message: str, client: OpenAI | None = None, model: str = MODEL,
                planner_client: OpenAI | None = None) -> dict:
-    client = client or _client()
+    calls: list[dict] = []
+    result = _run_routed(user_message, TimedClient(client or _client(), calls), model, planner_client, calls)
+    result["model_calls"] = calls
+    return result
+
+
+def _run_routed(user_message: str, client, model: str, planner_client, calls: list[dict]) -> dict:
     order_ids = find_orders(user_message)
     if len(order_ids) >= 2:
         return run_multi(user_message, order_ids, client, model)
@@ -191,11 +233,28 @@ def run_routed(user_message: str, client: OpenAI | None = None, model: str = MOD
     trace.append({"step": len(trace) + 1, "tool": "_decision", "arguments": "", "result": asdict(decision)})
 
     if decision.outcome == "escalate":
-        planner = planner_client or (_client(PLANNER_BASE_URL) if PLANNER_BASE_URL else client)
-        result = run_planner(user_message, client=planner, model=PLANNER_MODEL)
+        hosted = planner_client or (_client(PLANNER_BASE_URL) if PLANNER_BASE_URL else None)
+        if hosted is None:
+            result = run_planner(user_message, client=client, model=PLANNER_MODEL)
+        else:
+            result = run_planner(user_message, client=TimedClient(hosted, calls), model=PLANNER_MODEL)
+        fallback = False
+        if hosted is not None and result.get("error"):
+            acted = any(t["tool"] in ACTION_TOOLS and t["result"].get("ok") for t in result["trace"])
+            # Retry on the local model only if the hosted planner changed nothing in the store.
+            if not acted:
+                fallback = True
+                first = result
+                result = run_planner(user_message, client=client, model=model)
+                result["trace"] = first["trace"] + [{"step": 0, "tool": "_planner_fallback", "arguments": "",
+                                                     "result": {"error": first["error"]}}] + result["trace"]
+                result["nudges"] += first["nudges"]
+                for k in ("prompt", "completion"):
+                    result["tokens"][k] += first["tokens"][k]
         result["trace"] = trace + result["trace"]
         result["route"] = route
         result["escalated"] = True
+        result["planner_fallback"] = fallback
         result["latency_s"] = round(time.perf_counter() - start, 2)
         return result
 
@@ -245,3 +304,5 @@ if __name__ == "__main__":
             print(f"  {t['tool']}({t['arguments']})\n    -> {json.dumps(t['result'])[:200]}")
     print(f"\nANSWER: {result['answer']}")
     print(f"latency={result['latency_s']}s tokens={result['tokens']} escalated={result['escalated']}")
+    for call in result["model_calls"]:
+        print(f"  model call: {call['server']} {call['seconds']}s" + ("" if call["ok"] else f" FAILED {call['error']}"))

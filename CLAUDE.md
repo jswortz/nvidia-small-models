@@ -31,6 +31,7 @@ Known environment gotchas:
 - The 3090 runs out of memory with vLLM defaults. The flags above (`--max-num-seqs 8`, `--enforce-eager`, utilization 0.93) are what work. `--max-num-batched-tokens` must be at least `--max-model-len`.
 - `nim` is the model server. Never develop inside it; attach VS Code to `poc-dev`.
 - `pip` packages in `poc-dev` are lost when it is recreated: `pip install -r requirements.txt`.
+- The build.nvidia.com free tier is unpredictable: the same escalated case took 4 s to 30 s across runs, calls sometimes returned 500, and one hung for over 5 minutes. The OpenAI SDK default (600 s timeout, 2 retries) turns a hang into a long stall, which is why the planner client sets its own timeout.
 
 ## Layout
 
@@ -43,11 +44,13 @@ tools/mcp_server.py       Same tools over MCP (pinned mcp<2; 2.x renamed FastMCP
 agents/single_agent.py    Phase 2: one Nano agent with all tools, prompt rules, nudge harness
 agents/router.py          Phase 3: Nano classifies a message into intent, order_id, damaged, photo_provided, new_product (guided_json)
 agents/policy_engine.py   Phase 3: plain rules decide act, decline, info, need_info, or escalate, naming each clause
-agents/routed_agent.py    Phase 3: route, look up, decide, act in code, then Nano writes the reply. Escalations go to the planner.
+agents/routed_agent.py    Phase 3: route, look up, decide, act in code, then Nano writes the reply. Escalations go to the planner;
+                          a failed hosted planner call falls back to local Nano. Every model call is timed in result["model_calls"].
 evals/run_eval.py         Scores tools, final store state, citations, honesty (false promises), harmful actions, router accuracy, per group
 evals/cases_phase2.jsonl  Original 10 cases
 evals/cases_phase5.jsonl  62 cases in 11 failure-mode groups
-tests/                    smoke_test.py (15 checks), test_policy_engine.py (18 checks), test_router.py (7 checks, fake client). No model needed.
+tests/                    smoke_test.py (15 checks), test_policy_engine.py (18 checks), test_router.py (7 checks), test_multi_order.py (7 checks),
+                          test_planner_fallback.py (6 checks). Fake clients; no model needed.
 ```
 
 ## Commands (inside poc-dev, from /workspace)
@@ -56,6 +59,8 @@ tests/                    smoke_test.py (15 checks), test_policy_engine.py (18 c
 python tests/smoke_test.py
 python tests/test_policy_engine.py
 python tests/test_router.py
+python tests/test_multi_order.py
+python tests/test_planner_fallback.py
 python data/generate.py                                                   # reset the demo store
 python -m agents.routed_agent "My blender from order 1187 arrived cracked..."
 python evals/run_eval.py --agent routed --cases evals/cases_phase5.jsonl
@@ -109,7 +114,7 @@ Known gap: x003 sends two requests in one message; the routed agent handles one 
 
 1. Done in run 7. p007 and p009 were intent errors, v002 a missed `damaged` flag; all fixed. x003 remains (one request per message): detect two or more order numbers in code and handle or ask about each.
 2. Done in run 8: single agent 21/62 with 4 harmful actions vs routed 61/62 with 0. The pressure group had no harmful actions for either agent.
-3. Point the planner at hosted Nemotron Super: set `PLANNER_BASE_URL=https://integrate.api.nvidia.com/v1`, `PLANNER_MODEL` (exact id from build.nvidia.com), and `NVIDIA_API_KEY`.
+3. Done: the planner can use hosted Nemotron Super. Set `PLANNER_BASE_URL=https://integrate.api.nvidia.com/v1`, `PLANNER_MODEL` (exact id from build.nvidia.com), and `NVIDIA_API_KEY`. Hosted calls time out after `PLANNER_TIMEOUT_S` (default 30) with one retry, then fall back to local Nano; the eval reports fallbacks and per-server model time. Run benchmark comparisons with `PLANNER_BASE_URL` unset and report hosted runs separately.
 4. Phase 4: wrap the routed agent with NeMo Agent Toolkit (`nvidia-nat`) and profile tokens and latency per step.
 5. Phase 6 (written plan): LoRA on router errors; RL from verifiable rewards using final store state as the reward.
 

@@ -11,6 +11,7 @@ import re
 import sys
 import time
 
+import openai
 from openai import OpenAI
 
 from tools.registry import OPENAI_TOOLS, call_tool
@@ -60,8 +61,14 @@ def run_agent(user_message: str, client: OpenAI | None = None, model: str = MODE
     start = time.perf_counter()
 
     for step in range(1, max_steps + 1):
-        resp = client.chat.completions.create(model=model, messages=messages,
-                                              tools=OPENAI_TOOLS, temperature=0)
+        try:
+            resp = client.chat.completions.create(model=model, messages=messages,
+                                                  tools=OPENAI_TOOLS, temperature=0)
+        except openai.OpenAIError as exc:
+            # Return what happened so far instead of raising, so a caller can see any tools already run.
+            return {"answer": "Stopped: the model call failed.", "trace": trace, "steps": step,
+                    "tokens": tokens, "nudges": nudges, "latency_s": round(time.perf_counter() - start, 2),
+                    "stopped": True, "error": f"{type(exc).__name__}: {exc}"[:300]}
         if resp.usage:
             tokens["prompt"] += resp.usage.prompt_tokens
             tokens["completion"] += resp.usage.completion_tokens
