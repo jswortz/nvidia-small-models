@@ -31,6 +31,10 @@ from tools import policy_search
 from tools.registry import call_tool
 
 MODEL = os.getenv("AGENT_MODEL", "nvidia/NVIDIA-Nemotron-Nano-9B-v2")
+# Optional: send only router calls to another served model, such as the LoRA adapter "router-sft"
+# (served next to the base model with vLLM --lora-modules). Pair it with ROUTER_PROMPT=short, the
+# prompt the adapter was trained on. Unset means the router uses MODEL like every other call.
+ROUTER_MODEL = os.getenv("ROUTER_MODEL")
 # Optional: point the planner at hosted Nemotron Super. Unset means the local model plans too.
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", MODEL)
 PLANNER_BASE_URL = os.getenv("PLANNER_BASE_URL")
@@ -44,7 +48,7 @@ WRITER_PROMPT = """/no_think You write the final reply to a retail customer. The
 Rules:
 1. Two to four sentences, friendly and direct.
 2. Describe what happened using only "action_result". If "action_result" is null, nothing was refunded, replaced, or cancelled: do not say it was, and do not say you will do it.
-3. Cite every clause listed in "clauses" as (policy X.Y).
+3. Cite every clause listed in "clauses" as (policy X.Y). Cite no other clause numbers; if "clauses" is empty, cite none.
 4. If "outcome" is "need_info", ask for exactly what is missing.
 5. If "outcome" is "info" and "retrieved_policy" is given, answer from it and cite the clause that answers the question."""
 
@@ -136,7 +140,7 @@ def run_multi(user_message: str, order_ids: list[str], client: OpenAI, model: st
         # Same router, same prompt: the message is passed whole with a note naming the order to classify.
         with step("router"):
             route, usage = router.classify(f"{user_message}\n\n(Classify only the request about order {order_id}.)",
-                                           client, model)
+                                           client, ROUTER_MODEL or model)
         _add(tokens, usage)
         route["order_id"] = order_id  # Code found this order; the model does not get to change it.
         trace.append({"step": len(trace) + 1, "tool": "_route", "arguments": order_id, "result": route})
@@ -228,7 +232,7 @@ def _run_routed(user_message: str, client, model: str, planner_client, calls: li
 
     # 1. Understand
     with step("router"):
-        route, usage = router.classify(user_message, client, model)
+        route, usage = router.classify(user_message, client, ROUTER_MODEL or model)
     _add(tokens, usage)
     trace.append({"step": 1, "tool": "_route", "arguments": "", "result": route})
 

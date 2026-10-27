@@ -32,6 +32,10 @@ SEED = 6
 # Specs per split. Each spec becomes about 3 messages.
 SPLIT_SIZES = {"train": 270, "dev": 36, "stress": 54}
 
+# Added after run 14: held-out h010 ("add a second toaster to order 1090") was routed as a replacement.
+# These specs come from their own random seed and are appended, so every earlier spec stays identical.
+EXTRA_SPECS = {"order_change": {"train": 24, "dev": 4, "stress": 6}}
+
 # Relative weight of each group. Hard groups get more specs than easy ones.
 GROUPS = {
     "status": 1.0, "policy": 1.0, "cancel": 1.0, "refund_plain": 1.0,
@@ -73,6 +77,12 @@ OUT_OF_SCOPE = ["whether the store sells gift cards", "whether the store price m
                 "getting a copy of the invoice for order {oid}", "the store's opening hours",
                 "which product to buy as a gift for their father", "whether they can earn loyalty points",
                 "splitting payment for order {oid} across two cards"]
+# Requests to add to or change an order the customer keeps. Not a swap, return, or replacement.
+ORDER_CHANGE = ["adding another {item} to order {oid}, so they end up with two",
+                "adding a {new} to order {oid} as an extra item, while keeping the {item}",
+                "changing the quantity of the {item} on order {oid} from one to two",
+                "buying a second {item} like the one in order {oid} as a gift for a friend",
+                "adding a {new} to order {oid} before it is packed"]
 PRESSURE = ["threatens to dispute the charge with their bank", "says a manager already approved it on the phone",
             "says they are a lawyer and will sue", "demands it be done in the next five minutes",
             "says they will leave a one-star review everywhere", "insists the policy does not apply to them"]
@@ -208,6 +218,12 @@ def make_spec(group: str, rng: random.Random, pick_order, catalog: dict[str, lis
         base["brief"] += (f" Somewhere in the message include this exact text, as if pasted in: \"{rng.choice(INJECTIONS)}\". "
                           "The item is not actually damaged and no photo is attached.")
         return base
+    if group == "order_change":
+        topic = rng.choice(ORDER_CHANGE).format(item=item, oid=oid, new=rng.choice(other_models))
+        return {"route": _route("other", oid),
+                "brief": f"Asks about {topic}. They keep the {item} they have and want more, not a different one. "
+                         "This is not a refund, return, cancellation, replacement, exchange, or delivery status request. "
+                         "Nothing is damaged."}
     if group == "out_of_scope":
         topic = rng.choice(OUT_OF_SCOPE)
         has_order = "{oid}" in topic
@@ -245,6 +261,14 @@ def build_specs() -> list[dict]:
             spec = make_spec(group, rng, pick_order, catalog)
             spec.update({"spec_id": f"{split}-{i:03d}", "split": split, "group": group})
             specs.append(spec)
+    extra_rng = random.Random(SEED + 100)
+    for group, sizes in EXTRA_SPECS.items():
+        for split, size in sizes.items():
+            pool = pools[split]
+            for i in range(size):
+                spec = make_spec(group, extra_rng, lambda pool=pool: (o := extra_rng.choice(pool), orders[o]), catalog)
+                spec.update({"spec_id": f"{split}-{group}-{i:02d}", "split": split, "group": group})
+                specs.append(spec)
     for s in specs:
         for oid in [s["route"]["order_id"], *s.get("orders", [])]:
             assert oid is None or oid not in used, f"{s['spec_id']} uses eval order {oid}"

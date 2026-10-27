@@ -58,8 +58,9 @@ training/reward.py        Phase 6: store-state reward (+1.0 state match, -2.0 ha
 training/build_sft_data.py, configs/router_peft.yaml, merge_lora.py   Phase 6 step 3: LoRA SFT with NeMo AutoModel, merge
 training/grpo/, configs/router_grpo.yaml   Phase 6 step 4: GRPO with NeMo RL v0.7.0; router_env.py wraps reward.py
 training/brev/            Scripts run on the rented GPU: run_sft.sh, run_grpo.sh, eval_router.sh
-tests/                    smoke_test.py (15 checks), test_policy_engine.py (18 checks), test_router.py (9 checks), test_multi_order.py (7 checks),
-                          test_planner_fallback.py (6 checks), test_nat_profiling.py (5 checks), test_reward.py (10 checks). Fake clients;
+tests/                    smoke_test.py (15 checks), test_policy_engine.py (21 checks), test_router.py (9 checks), test_multi_order.py (7 checks),
+                          test_planner_fallback.py (7 checks), test_nat_profiling.py (5 checks), test_reward.py (10 checks),
+                          test_eval_scoring.py (5 checks). Fake clients;
                           no model needed. test_merge_lora.py (1 check) needs torch, so it runs in the training container.
 ```
 
@@ -73,11 +74,13 @@ python tests/test_multi_order.py
 python tests/test_planner_fallback.py
 python tests/test_nat_profiling.py
 python tests/test_reward.py
+python tests/test_eval_scoring.py
 python evals/run_router_eval.py --cases training/data/router_stress_test.jsonl --prompt short   # router alone
 python data/generate.py                                                   # reset the demo store
 python -m agents.routed_agent "My blender from order 1187 arrived cracked..."
 python evals/run_eval.py --agent routed --cases evals/cases_phase5.jsonl
 python evals/run_eval.py --agent routed --cases evals/cases_phase5.jsonl --profile   # plus NAT per-stage tokens and time
+ROUTER_MODEL=router-sft ROUTER_PROMPT=short python evals/run_eval.py --agent routed --cases evals/cases_holdout.jsonl   # trained router (needs nim on the merged model)
 python evals/run_eval.py --agent single --cases evals/cases_phase5.jsonl
 ```
 
@@ -104,6 +107,8 @@ Each eval case gets a fresh temporary store, so evals never touch `data/store.db
 | 10 | Run 9 with the planner on hosted Nemotron Super (`nvidia/nemotron-3.5-super-vl-120b-a12b`), out_of_scope cases o001 to o003 (all escalate) | Answers were correct whenever the endpoint responded, but latency was unpredictable: 5.7 to 16.1 s average across four runs (the local planner averaged 6.1 s on this group in run 8), slowest single call 16 s, and one run lost o002 and o003 to HTTP 500 errors. With a 30 s timeout and local fallback added, a run with forced timeouts passed 3/3 with 3 fallbacks, 7.2 s average |
 | 11 | Phase 4: run 9 code with NeMo Agent Toolkit profiling (`--profile`), local planner, `--enforce-eager` | 62/62, 0 harmful, 0 false promises. 4.91 s per case (95% CI 4.63 to 5.19), 2.33 s per model call. Model calls are about 99.8% of case time; lookup, engine, and action together take about 10 ms |
 | 12 | Run 11 with `--enforce-eager` removed from the `nim` command (CUDA graphs on) | 62/62, 0 harmful, 0 false promises, identical routes and answers on all 62 cases. 3.13 s per case (95% CI 2.94 to 3.32), 1.49 s per model call: 36% faster |
+| 14 | Run 12 with the LoRA SFT router (run 13) merged into the served model, short router prompt, local planner. One model on the 3090, so the writer and planner also run on the merged weights | 62 cases: 62/62, 0 harmful, 0 false promises, router 62/62, 2.7 s per case (router 1.20 s, writer 1.50 s). Held-out: 10/11 with 1 harmful action (h010 "add a second toaster to order 1090" routed as a replacement, and the engine issued a same-product swap), and h009 passed while the planner invented a gift wrapping policy under clause 2.1 |
+| 15 | Run 14 plus four fixes: engine declines a no-damage swap for the same product and asks which product when none is named; router retrained with 66 "add to my order" examples (run 15 SFT); writer told to cite no clause outside `clauses`; eval fails ungrounded citations and no longer counts negated sentences as false promises | Local planner: 62 cases 60/62, held-out 9/11, 0 harmful, 0 false promises, router 62/62 and 11/11, 2.8 s per case. Hosted Super planner: 62 cases 61/62, held-out 11/11, 0 harmful, 0 false promises, 3.3 s per case. Every remaining failure is an ungrounded citation: the local planner (o002, h009, h010) or the writer asking for a missing order number (m003) |
 
 Runs 11 and 12 by stage (NAT profile, average per case where the stage ran; tokens are the same in both runs):
 
@@ -145,7 +150,7 @@ Key lessons: the 9B model handled intent and wording well and policy decisions p
 2. Done in run 8: single agent 21/62 with 4 harmful actions vs routed 61/62 with 0. The pressure group had no harmful actions for either agent.
 3. Done: the planner can use hosted Nemotron Super. Set `PLANNER_BASE_URL=https://integrate.api.nvidia.com/v1`, `PLANNER_MODEL` (exact id from build.nvidia.com), and `NVIDIA_API_KEY`. Hosted calls time out after `PLANNER_TIMEOUT_S` (default 30) with one retry, then fall back to local Nano; the eval reports fallbacks and per-server model time. Run benchmark comparisons with `PLANNER_BASE_URL` unset and report hosted runs separately.
 4. Done in runs 11 and 12: NeMo Agent Toolkit profiling per stage. The policy engine costs 0.03 ms; time is almost all router and writer model calls. Further speedups come from fewer or shorter model calls.
-5. Phase 6 on branch `phase6-router-training`. Steps 1 to 3 done (results below). Step 4 (GRPO) did not complete: three attempts on one A100 80 GB ran out of host RAM (details below). SFT is the trained router. Step 5 (serve the trained router on the 3090) needs the merged model, which is 17 GB against about 26 GB free on C:.
+5. Phase 6 on branch `phase6-router-training`. Steps 1 to 3 done. Step 4 (GRPO) did not complete: three attempts on one A100 80 GB ran out of host RAM. Step 5 done: the run 15 SFT router is merged and served on the 3090 (run 15). Recommended setup: trained router plus hosted Super planner, because the merged weights also run the local planner and it invents clause numbers. Open: the writer still sometimes cites a clause when asking for an order number (m003).
 
 ## Phase 6 results
 
@@ -156,6 +161,9 @@ Router alone, exact route (all five fields right) and harmful routes under `trai
 | Base Nano 9B | full (current agent) | 56/83 (67%) | 114/147 (78%) | 0, 0 | 1.32 s on 3090 |
 | Base Nano 9B | short | 72/83 (87%) | 126/147 (86%) | 0, 0 | 1.22 s on 3090 |
 | LoRA SFT (run 13) | short | 83/83 (100%) | 144/147 (98%) | 0, 0 | 0.71 s on A100 (not comparable) |
+| LoRA SFT (run 15, plus order_change data) | short | 95/95 (100%) | 165/165 (100%) | 0, 0 | 1.28 to 1.34 s on 3090 |
+
+Dev and stress grew in run 15: 12 and 18 new `order_change` messages, all other rows unchanged. On the original 147 stress messages run 15 scores 147/147 on the 3090 (146/147 on the A100, where it missed stress-005-1 again). On the 30 new messages, the run 13 router scored 16/30 and read 4 as replacements; run 15 scores 30/30.
 
 - The short prompt alone beat the full prompt, mostly on `new_product` (84% to 100% on stress). The full prompt's wording pushed the model to paraphrase product names.
 - Run 13: LoRA rank 16, alpha 32, lr 1e-4, batch 16, 160 steps (3.8 epochs) on 676 examples; best checkpoint by dev loss was step 128 (val loss 0.0007). Training took 4 minutes; peak memory 18.3 GB, so this run would also fit on the 3090 with `nim` stopped.
@@ -164,8 +172,13 @@ Router alone, exact route (all five fields right) and harmful routes under `trai
 - GRPO (NeMo RL v0.7.0, LoRA on the merged SFT model) never finished a step. Attempt 1: config error (`match_all_linear` with `exclude_modules`). Attempt 2: Ray killed the policy worker during load at 95% of 94 GB host RAM (policy worker 53 GB, since it loads in float32; vLLM worker 29 GB). Attempt 3: added 64 GB swap and turned off Ray's memory monitor; the model loaded and the starting validation ran, but step 1 filled RAM and swap, the machine stopped responding for about 10 minutes, and Ray died. Fitting it needs a node with more host RAM (about 200 GB or more) or a colocated setup that does not hold two full copies on the host.
 - GRPO starting validation found that without guided decoding, at temperature 1.0, the SFT router wraps most outputs in a ```json fence: mean reward 0.16, 10 of 83 scored 1.35 and 73 scored 0 (the strict reward rejects fenced JSON). The routes inside the fences looked right. The live agent always uses guided_json, so this does not affect it.
 - GRPO logs: `training/output/grpo_logs/` (local, gitignored).
+- Run 15 data: `training/specs.py` adds `EXTRA_SPECS` (an `order_change` group: add another of the same item, add a different item, raise the quantity), built from a separate seed and appended so the first 355 specs are byte-identical. Messages from hosted Super. Regenerating also re-rolled a few uncached old specs, so the data files were rebuilt as the previous rows exactly plus the new `order_change` rows: train 742, dev 95, stress 165.
+- Run 15 SFT: same recipe and 160 steps on 742 examples; best checkpoint step 119 (val loss 0.0008). Brev A100 80 GB (hyperstack, $1.62/hr), session 2: 19:59 to 20:28 UTC, 0.48 h, about $0.77. The AutoModel image takes 51 GB on disk there, so the merge first ran out of space; deleting the image and running `docker system prune -a` freed it, and the merge ran in the vLLM image. Phase 6 GPU total: about $3.42.
+- Eval scoring changed in run 15, so earlier runs were rescored from their traces: run 12 (base) 59/62 and run 9 held-out 10/11 (3 and 1 ungrounded citations); run 14 53/62 and held-out 9/11; run 8 single agent 11/62 (47 ungrounded, 7 false promises).
+- Serving (step 5): vLLM v0.10.1 loads the adapter with `--enable-lora` but does not apply it to Nemotron Nano: all 83 dev routes matched the base model exactly, with no error. The merged model works: merge inside `nim` (`docker exec nim sh -c 'python3 /adapters/merge_lora.py --base $(ls -d /root/.cache/huggingface/hub/models--nvidia--NVIDIA-Nemotron-Nano-9B-v2/snapshots/*) --adapter /adapters/router-sft-adapter --out /adapters/router-sft'`, with `C:\poc\checkpoints` mounted at `/adapters`), then run `nim` with `--model /adapters/router-sft --served-model-name nvidia/NVIDIA-Nemotron-Nano-9B-v2 router-sft`. Set `ROUTER_MODEL=router-sft ROUTER_PROMPT=short` for the agent. On the 3090: dev 83/83, stress 144/147, 1.22 s per router call (run 13 router). To swap in another adapter, stop `nim`, delete `C:\poc\checkpoints\router-sft` (no room for two merged copies), merge with `docker run --rm --entrypoint sh` on the vLLM image, and start `nim` again.
+- Run 14 regressions on the held-out set: h010 shows the router never saw "add an item to my order" requests, and that the engine allows a no-damage replacement with the same product the customer already has. h009 shows the merged weights made the planner invent policy; the eval scored it a pass because it checks false promises, not invented clauses.
 - Fixes found along the way: `router.parse` now keeps only text for `new_product` (the base model sometimes returned `true`, which crashed product search); `reward.py` pointed product search at a deleted temp store; AutoModel's merge tool fails to save Nemotron Nano under the newer transformers, so `training/merge_lora.py` merges at the weight-file level and keeps the base model's files unchanged.
-- Artifacts: adapter in `checkpoints/router-sft-adapter/` (78 MB, local); merged model in `checkpoints/router-sft/` on the instance only. Eval traces: `evals/results/router_router_*_20261027_*.jsonl`.
+- Artifacts (local, gitignored): run 13 adapter `checkpoints/router-sft-adapter/`, run 15 adapter `checkpoints/router-sft2-adapter/` (78 MB each), merged run 15 model `checkpoints/router-sft/` (17 GB, what `nim` serves), run 15 logs `training/output/sft2_logs/`. Eval traces: `evals/results/router_router_*_20261027_*.jsonl`.
 
 ## Working style
 
