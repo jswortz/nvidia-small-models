@@ -22,12 +22,12 @@ Launch parameters reach the setup script only, so `setup.sh` passes them on to t
 
 ## What runs
 
-| Step | Time on an A100 (estimate) | Needs |
+| Step | Time (measured on an A6000, except Phase 6) | Needs |
 | --- | --- | --- |
-| Pull images, download the model (17 GB), start vLLM | 10 to 15 min | |
+| Pull images, download the model (17 GB), start vLLM | 14 min | |
 | Offline tests (79 checks, fake clients) | under 1 min | |
-| Routed agent, 62 cases with NAT profiling, then 11 held-out cases, local planner | 5 min | |
-| Single-agent baseline, 62 cases | 7 min | `SKIP_SINGLE=no` |
+| Routed agent, 62 cases with NAT profiling, then 11 held-out cases, local planner | 4 min | |
+| Single-agent baseline, 62 cases | 5 min | `SKIP_SINGLE=no` |
 | Routed agent again with hosted Nemotron Super as the planner | 5 min | `NVIDIA_API_KEY` |
 | Router alone (base, both prompts), LoRA SFT, merge, restart vLLM on the merged model, router and routed evals again | 30 to 40 min | `PHASE6=yes` |
 
@@ -35,16 +35,21 @@ Watch progress with `tail -f ~/poc-reproduce.log`. The log ends with `REPRODUCE_
 
 Stop or delete the instance when the summary is written. The setup has no reason to keep running.
 
+## Tested run
+
+Tested 2026-10-27 on a Brev A6000 48 GB (massedcompute, $0.68/hr) with `NVIDIA_API_KEY` set and `PHASE6=no`. Setup took 14 minutes and the evals 13, so the whole run cost about $0.39 including boot. Every result below matched the 3090 except the single agent (12/62, 6 harmful) and the hosted-planner 62-case run (62/62). Phase 6 was not run on Brev through this script; its steps are the ones used in the Phase 6 sessions.
+
 ## Expected results
 
-From the desktop RTX 3090 runs (see the main README). Accuracy should match closely; time per case will differ by GPU.
+From the desktop RTX 3090 runs on this code (run 16 in CLAUDE.md for the base model). Accuracy should match closely; time per case will differ by GPU.
 
 | Run | Expected |
 | --- | --- |
 | Offline tests | All checks pass |
-| Routed agent, 62 cases, local planner | 59/62 to 60/62, 0 harmful, 0 false promises, router 62/62. The misses are ungrounded citations |
-| Routed agent, held-out 11, local planner | 10/11, 0 harmful, router 11/11 |
-| Single agent, 62 cases | About 11/62 under the citation check, with harmful actions and false promises |
+| Routed agent, 62 cases, local planner | 60/62, 0 harmful, 0 false promises, router 62/62. Both misses are ungrounded citations (v005 from the writer, o002 from the planner) |
+| Routed agent, held-out 11, local planner | 10/11, 0 harmful, 0 false promises, router 11/11. The miss is h010, an ungrounded planner citation |
+| Single agent, 62 cases | 11/62 to 12/62, 4 to 6 harmful actions, 7 to 8 false promises. The single agent varies more from run to run |
+| Routed agent, hosted Super planner (base router) | 61/62 to 62/62 and 11/11, 0 harmful, 0 false promises |
 | Fine-tuned router + hosted Super planner | 61/62 and 11/11, 0 harmful, 0 false promises |
 | Router alone, fine-tuned (dev, stress) | 95/95 and 165/165 on the 3090 |
 

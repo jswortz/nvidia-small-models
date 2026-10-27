@@ -43,7 +43,9 @@ run() {
   echo "== $(date -u +%T) $title"
   docker exec poc-dev bash -c "$cmd" > "results/$name.txt" 2>&1 || echo "(exited with an error, see results/$name.txt)" >> "results/$name.txt"
   { echo; echo "### $title"; echo '```'
-    grep -aE "^Agent:|^Router accuracy|^Model calls|^Model: |checks passed|FAIL  |Traceback|exited with an error" "results/$name.txt" || true
+    # Failing case lines only when there are few of them (the single agent fails most cases).
+    [ "$(grep -ac 'FAIL  ' "results/$name.txt")" -le 10 ] && grep -a 'FAIL  ' "results/$name.txt" || true
+    grep -aE "^Agent:|^Router accuracy|^Model calls|^Model: |checks passed|Traceback|exited with an error" "results/$name.txt" || true
     echo '```'; } >> "$SUMMARY"
   tail -n 4 "results/$name.txt"
 }
