@@ -1,0 +1,95 @@
+# Phase 6 step 4: GRPO on the router with the store-state reward (training/reward.py).
+# Based on NeMo RL v0.7.0 examples/configs/recipes/llm/grpo-nano-v2-12b-2n8g-fsdp2tp1.yaml
+# (Nemotron Nano v2 settings) and grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml (LoRA), scaled to 1 GPU.
+#
+# Starts from the merged SFT router (checkpoints/router-sft). Run inside nvcr.io/nvidia/nemo-rl:v0.7.0
+# from the repo root, after python training/grpo/build_grpo_data.py:
+#   python training/grpo/run_grpo.py --config training/configs/router_grpo.yaml
+# Rerunning resumes from the latest checkpoint in checkpointing.checkpoint_dir.
+defaults: /opt/nemo-rl/examples/configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 16          # 16 messages x 8 sampled routes = 128 rollouts per step
+  num_generations_per_prompt: 8
+  max_num_steps: 40                 # about one pass over the 676 training messages
+  val_period: 10
+  val_at_start: true                # validation reward of the SFT model, before any RL
+  val_at_end: true
+  max_val_samples: 83               # the whole dev split
+  val_batch_size: 83
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: checkpoints/router-grpo-train
+  metric_name: "val:exact_route_rate"
+  higher_is_better: true
+  keep_top_k: 2
+  save_period: 10
+  save_consolidated: true          # Hugging Face format, so the SFT merge and eval path works unchanged
+
+policy:
+  model_name: /poc/checkpoints/router-sft
+  tokenizer:
+    name: /poc/checkpoints/router-sft
+  max_total_sequence_length: 512    # prompts are under 300 tokens and a route is about 50
+  train_global_batch_size: 128      # all rollouts of a step in one update
+  train_micro_batch_size: 4
+  logprob_batch_size: 4
+  dtensor_cfg:
+    automodel_kwargs:
+      force_hf: true                # NemotronH needs this (from NVIDIA's Nano v2 recipe)
+    activation_checkpointing: true
+    lora_cfg:
+      enabled: true
+      exclude_modules: ["*out_proj"]  # Mamba out_proj uses fused kernels; LoRA does not work there
+      match_all_linear: false         # with an exclude list this still covers every other linear layer (same as SFT)
+      dim: 16
+      alpha: 32
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  optimizer:
+    kwargs:
+      lr: 2.0e-5                    # LoRA; recipe default 5e-6 is for full fine-tuning
+  generation:
+    max_new_tokens: 96
+    temperature: 1.0                # sampling spread gives GRPO different routes to compare
+    vllm_cfg:
+      max_model_len: 512
+      gpu_memory_utilization: 0.4   # colocated with training on one GPU
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32  # from NVIDIA's Nano v2 recipe: avoids SSM state overflow
+      max_num_seqs: 128
+
+data:
+  max_input_seq_length: 512
+  train:   # name the dataset and turn off the split, or the OpenMathInstruct-2 defaults are inherited
+    dataset_name: ResponseDataset
+    data_path: training/output/grpo/train.jsonl
+    split_validation_size: 0
+  validation:
+    dataset_name: ResponseDataset
+    data_path: training/output/grpo/val.jsonl
+  default:
+    dataset_name: ResponseDataset
+    input_key: input
+    output_key: output
+    prompt_file: null
+    system_prompt_file: training/output/grpo/system_prompt.txt
+    processor: math_hf_data_processor   # builds system + user chat; passes "output" as ground_truth
+    env_name: router
+
+env:
+  router: {}
+
+logger:
+  log_dir: logs/grpo
+  wandb_enabled: false
+  tensorboard_enabled: true
+  num_val_samples_to_print: 3
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1

@@ -131,4 +131,14 @@ except openai.APITimeoutError:
 assert log[0]["server"] == "hosted.example" and not log[0]["ok"]
 ok("TimedClient logs a failed call and re-raises it")
 
+# ROUTER_MODEL sends only the router call to the adapter; the planner keeps its own model.
+routed_agent.ROUTER_MODEL = "router-sft"
+try:
+    result = run_routed("Do you sell gift cards?", client=LocalClient())
+finally:
+    routed_agent.ROUTER_MODEL = None
+models = [c["model"] for c in result["model_calls"]]
+assert models == ["router-sft", routed_agent.PLANNER_MODEL], models
+ok("ROUTER_MODEL is used for the router call only")
+
 print(f"\nAll {passed} checks passed.")

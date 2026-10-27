@@ -6,6 +6,7 @@ whether the store allows it. That is the policy engine's job.
 from __future__ import annotations
 
 import json
+import os
 import re
 
 INTENTS = ["order_status", "policy_question", "cancel", "refund", "replacement", "other"]
@@ -49,9 +50,28 @@ Examples (message -> intent, damaged):
 # Example order numbers above (2012 to 2090) are outside the store's 1000s range on purpose,
 # so the prompt never hints at a real test order. tests/test_router.py checks this.
 
+# Phase 6: a fine-tuned router learns the rules from its training examples, so it gets
+# this short prompt instead (fewer prompt tokens per call). Training data uses the same text.
+SHORT_PROMPT = ("/no_think Classify the customer support message as JSON with intent "
+                "(order_status, policy_question, cancel, refund, replacement, other), "
+                "order_id, damaged, photo_provided, new_product.")
+
+
+def prompt_for(style: str | None = None) -> str:
+    """The router prompt: 'short' for a fine-tuned router, otherwise the full prompt.
+
+    Set ROUTER_PROMPT=short in the environment to use the short one everywhere."""
+    style = style or os.getenv("ROUTER_PROMPT", "full")
+    return SHORT_PROMPT if style == "short" else ROUTER_PROMPT
+
 _ORDER_ID = re.compile(r"\b(\d{4})\b")
 _JSON = re.compile(r"\{.*\}", re.DOTALL)
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _text(value) -> str | None:
+    """A non-empty string or None. A model can emit true or 0 here; only text is a product name."""
+    return (value.strip() or None) if isinstance(value, str) else None
 
 
 def parse(text: str) -> dict:
@@ -65,18 +85,18 @@ def parse(text: str) -> dict:
     order_id = data.get("order_id")
     return {
         "intent": intent,
-        "order_id": str(order_id).strip("# ") if order_id else None,
+        "order_id": str(order_id).strip("# ") if isinstance(order_id, (str, int)) and order_id else None,
         "damaged": data.get("damaged") is True,
         "photo_provided": data.get("photo_provided") is True,
-        "new_product": data.get("new_product") or None,
+        "new_product": _text(data.get("new_product")),
     }
 
 
-def classify(message: str, client, model: str) -> tuple[dict, dict]:
-    """Return (route, token usage) for one customer message."""
+def classify(message: str, client, model: str, prompt: str | None = None) -> tuple[dict, dict]:
+    """Return (route, token usage) for one customer message. prompt: 'full' or 'short' (see prompt_for)."""
     resp = client.chat.completions.create(
         model=model,
-        messages=[{"role": "system", "content": ROUTER_PROMPT},
+        messages=[{"role": "system", "content": prompt_for(prompt)},
                   {"role": "user", "content": message}],
         temperature=0,
         max_tokens=200,
@@ -84,10 +104,12 @@ def classify(message: str, client, model: str) -> tuple[dict, dict]:
     )
     usage = {"prompt": resp.usage.prompt_tokens, "completion": resp.usage.completion_tokens} if resp.usage \
         else {"prompt": 0, "completion": 0}
-    route = parse(resp.choices[0].message.content or "")
+    return backstop(parse(resp.choices[0].message.content or ""), message), usage
 
-    # Deterministic backstop: if the model missed an order number that is plainly there, take it.
+
+def backstop(route: dict, message: str) -> dict:
+    """Deterministic backstop: if the model missed an order number that is plainly there, take it."""
     if route["order_id"] is None and route["intent"] not in ("policy_question", "other"):
         found = _ORDER_ID.search(message)
         route["order_id"] = found.group(1) if found else None
-    return route, usage
+    return route

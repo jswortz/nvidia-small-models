@@ -91,6 +91,16 @@ def decide(route: dict, order: dict | None, product: dict | None = None) -> Deci
             return Decision("need_info", "The requested model could not be found. Ask which product they want.")
         if product is not None and product["category"] != order["category"]:
             return Decision("decline", "A swap must be for a product in the same category.", [clause])
+        if not route["damaged"]:
+            # An exchange (3.1) is for a different size, color, or model. Without damage, the same
+            # product again is not an exchange: "add a second toaster" once routed here and got a swap.
+            if product is None:
+                return Decision("need_info", "An exchange is for a different size, color, or model. "
+                                "Ask which product they want instead.", ["3.1"])
+            if product["product_id"] == order["product_id"]:
+                return Decision("decline", "They asked for the same product they already have, and nothing is "
+                                "damaged, so this is not an exchange. Exchanges are for a different size, "
+                                "color, or model.", ["3.1"])
         args = {"order_id": order["order_id"], "reason": f"{reason} (policy {clause})"}
         if product is not None:
             args["new_product_id"] = product["product_id"]

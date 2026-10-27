@@ -76,6 +76,15 @@ check("non-damaged cross-category exchange cites the exchange clause",
 check("final sale exchange is declined before asking which model",
       decide(route("replacement", "1047", new_product="a different one"), lookup_order("1047"), None),
       "decline", ["1.3"])
+toaster_order = lookup_order("1090")  # SteadyHeat Toaster 2-Slice, delivered 3 days ago
+same_toaster = search_products("SteadyHeat Toaster 2-Slice")["results"][0]
+assert same_toaster["product_id"] == toaster_order["product_id"]
+check("undamaged swap for the same product is not an exchange (held-out h010)",
+      decide(route("replacement", "1090", new_product="Toaster"), toaster_order, same_toaster), "decline", ["3.1"])
+check("undamaged exchange with no product named asks which one",
+      decide(route("replacement", "1090"), toaster_order), "need_info", ["3.1"])
+check("damaged item can still be replaced with the same product",
+      decide(route("replacement", "1090", damaged=True), toaster_order), "act", ["4.2"], "create_replacement")
 check("final sale item that arrived damaged can still be refunded within 7 days",
       decide(route("refund", "1150", damaged=True), lookup_order("1150")), "act", ["4.1"], "issue_refund")
 check("missing order number asks for it", decide(route("refund"), None), "need_info")
