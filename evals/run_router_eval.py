@@ -28,10 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from openai import OpenAI  # noqa: E402
-
 from agents import router  # noqa: E402
-from agents.single_agent import MODEL  # noqa: E402
 
 FIELDS = ["intent", "order_id", "damaged", "photo_provided", "new_product"]
 
@@ -65,6 +62,11 @@ def effective_route(route: dict, case: dict) -> dict:
 
 
 def main() -> None:
+    # Imported here so training/reward.py can use field_scores without the openai package.
+    from openai import OpenAI
+
+    from agents.single_agent import MODEL
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--model", default=os.getenv("ROUTER_MODEL", MODEL))
@@ -72,6 +74,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1,
                         help="parallel requests; keep 1 when latency matters, since batching changes it")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--prompt", choices=["full", "short"], default=os.getenv("ROUTER_PROMPT", "full"),
+                        help="router prompt: full for the base model, short for a fine-tuned router")
     args = parser.parse_args()
 
     _store()
@@ -80,7 +84,7 @@ def main() -> None:
 
     def run(case: dict) -> dict:
         start = time.perf_counter()
-        route, usage = router.classify(case["router_input"], client, args.model)
+        route, usage = router.classify(case["router_input"], client, args.model, args.prompt)
         seconds = time.perf_counter() - start
         route = effective_route(route, case)
         scores = field_scores(route, case["expected_route"])
@@ -109,7 +113,7 @@ def main() -> None:
         for name in sorted(buckets):
             print(line(name, buckets[name]))
     print("\n" + line("ALL", rows))
-    print(f"\nModel: {args.model}   Exact route: {sum(r['exact'] for r in rows)}/{len(rows)}   "
+    print(f"\nModel: {args.model}   Prompt: {args.prompt}   Exact route: {sum(r['exact'] for r in rows)}/{len(rows)}   "
           f"Avg latency: {sum(r['seconds'] for r in rows) / len(rows):.2f}s (workers={args.workers})   "
           f"Avg prompt tokens: {sum(r['prompt_tokens'] for r in rows) / len(rows):.0f}")
     print(f"Results: {out}")

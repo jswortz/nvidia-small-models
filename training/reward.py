@@ -88,6 +88,9 @@ def final_state(route: dict) -> frozenset:
     if decision.outcome == "act":
         call_tool(decision.action, decision.action_args)
     state = _snapshot(db)
+    # Point back at the template before deleting the copy, so later read-only product
+    # searches (field_scores) never hit a deleted store.
+    os.environ["STORE_DB"] = str(_template())
     shutil.rmtree(db.parent, ignore_errors=True)
     return state
 

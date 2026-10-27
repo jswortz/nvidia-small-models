@@ -52,8 +52,15 @@ evals/run_eval.py         Scores tools, final store state, citations, honesty (f
 evals/cases_phase2.jsonl  Original 10 cases
 evals/cases_phase5.jsonl  62 cases in 11 failure-mode groups
 evals/cases_holdout.jsonl 11 held-out cases: 10 new wordings of the run 6 router errors, plus h011 (two orders, one allowed and one declined)
-tests/                    smoke_test.py (15 checks), test_policy_engine.py (18 checks), test_router.py (7 checks), test_multi_order.py (7 checks),
-                          test_planner_fallback.py (6 checks), test_nat_profiling.py (5 checks). Fake clients; no model needed.
+evals/run_router_eval.py  Phase 6: scores the router alone against labeled routes (--prompt full|short, --model, --base-url)
+training/specs.py, generate_messages.py   Phase 6: synthetic router data; training/data/ holds train 676, dev 83, stress 147
+training/reward.py        Phase 6: store-state reward (+1.0 state match, -2.0 harmful, +0.25 exact route, +0.1 valid JSON)
+training/build_sft_data.py, configs/router_peft.yaml, merge_lora.py   Phase 6 step 3: LoRA SFT with NeMo AutoModel, merge
+training/grpo/, configs/router_grpo.yaml   Phase 6 step 4: GRPO with NeMo RL v0.7.0; router_env.py wraps reward.py
+training/brev/            Scripts run on the rented GPU: run_sft.sh, run_grpo.sh, eval_router.sh
+tests/                    smoke_test.py (15 checks), test_policy_engine.py (18 checks), test_router.py (9 checks), test_multi_order.py (7 checks),
+                          test_planner_fallback.py (6 checks), test_nat_profiling.py (5 checks), test_reward.py (10 checks). Fake clients;
+                          no model needed. test_merge_lora.py (1 check) needs torch, so it runs in the training container.
 ```
 
 ## Commands (inside poc-dev, from /workspace)
@@ -65,6 +72,8 @@ python tests/test_router.py
 python tests/test_multi_order.py
 python tests/test_planner_fallback.py
 python tests/test_nat_profiling.py
+python tests/test_reward.py
+python evals/run_router_eval.py --cases training/data/router_stress_test.jsonl --prompt short   # router alone
 python data/generate.py                                                   # reset the demo store
 python -m agents.routed_agent "My blender from order 1187 arrived cracked..."
 python evals/run_eval.py --agent routed --cases evals/cases_phase5.jsonl
@@ -136,7 +145,27 @@ Key lessons: the 9B model handled intent and wording well and policy decisions p
 2. Done in run 8: single agent 21/62 with 4 harmful actions vs routed 61/62 with 0. The pressure group had no harmful actions for either agent.
 3. Done: the planner can use hosted Nemotron Super. Set `PLANNER_BASE_URL=https://integrate.api.nvidia.com/v1`, `PLANNER_MODEL` (exact id from build.nvidia.com), and `NVIDIA_API_KEY`. Hosted calls time out after `PLANNER_TIMEOUT_S` (default 30) with one retry, then fall back to local Nano; the eval reports fallbacks and per-server model time. Run benchmark comparisons with `PLANNER_BASE_URL` unset and report hosted runs separately.
 4. Done in runs 11 and 12: NeMo Agent Toolkit profiling per stage. The policy engine costs 0.03 ms; time is almost all router and writer model calls. Further speedups come from fewer or shorter model calls.
-5. Phase 6 (written plan): LoRA on router errors; RL from verifiable rewards using final store state as the reward.
+5. Phase 6 on branch `phase6-router-training`. Steps 1 to 3 done (results below). Step 4 (GRPO) did not complete: three attempts on one A100 80 GB ran out of host RAM (details below). SFT is the trained router. Step 5 (serve the trained router on the 3090) needs the merged model, which is 17 GB against about 26 GB free on C:.
+
+## Phase 6 results
+
+Router alone, exact route (all five fields right) and harmful routes under `training/reward.py`. Dev is 83 messages in the training style; stress is 147 held-out messages in unseen styles (non-native, rambling, terse). The 62-case and held-out eval sets were never used for training.
+
+| Router | Prompt | Dev exact | Stress exact | Harmful (dev, stress) | Latency |
+| --- | --- | --- | --- | --- | --- |
+| Base Nano 9B | full (current agent) | 56/83 (67%) | 114/147 (78%) | 0, 0 | 1.32 s on 3090 |
+| Base Nano 9B | short | 72/83 (87%) | 126/147 (86%) | 0, 0 | 1.22 s on 3090 |
+| LoRA SFT (run 13) | short | 83/83 (100%) | 144/147 (98%) | 0, 0 | 0.71 s on A100 (not comparable) |
+
+- The short prompt alone beat the full prompt, mostly on `new_product` (84% to 100% on stress). The full prompt's wording pushed the model to paraphrase product names.
+- Run 13: LoRA rank 16, alpha 32, lr 1e-4, batch 16, 160 steps (3.8 epochs) on 676 examples; best checkpoint by dev loss was step 128 (val loss 0.0007). Training took 4 minutes; peak memory 18.3 GB, so this run would also fit on the 3090 with `nim` stopped.
+- SFT stress misses: stress-005-1 (policy question read as other), stress-041-1 (multi-order, refund instead of replacement), stress-046-2 (product named where none was asked). None changes the store.
+- Brev A100 80 GB (massedcompute, $1.62/hr), session 1: 16:51 to 18:29 UTC, 1.64 h, about $2.65, covering setup, SFT, merge, eval, and three GRPO attempts. Instance deleted.
+- GRPO (NeMo RL v0.7.0, LoRA on the merged SFT model) never finished a step. Attempt 1: config error (`match_all_linear` with `exclude_modules`). Attempt 2: Ray killed the policy worker during load at 95% of 94 GB host RAM (policy worker 53 GB, since it loads in float32; vLLM worker 29 GB). Attempt 3: added 64 GB swap and turned off Ray's memory monitor; the model loaded and the starting validation ran, but step 1 filled RAM and swap, the machine stopped responding for about 10 minutes, and Ray died. Fitting it needs a node with more host RAM (about 200 GB or more) or a colocated setup that does not hold two full copies on the host.
+- GRPO starting validation found that without guided decoding, at temperature 1.0, the SFT router wraps most outputs in a ```json fence: mean reward 0.16, 10 of 83 scored 1.35 and 73 scored 0 (the strict reward rejects fenced JSON). The routes inside the fences looked right. The live agent always uses guided_json, so this does not affect it.
+- GRPO logs: `training/output/grpo_logs/` (local, gitignored).
+- Fixes found along the way: `router.parse` now keeps only text for `new_product` (the base model sometimes returned `true`, which crashed product search); `reward.py` pointed product search at a deleted temp store; AutoModel's merge tool fails to save Nemotron Nano under the newer transformers, so `training/merge_lora.py` merges at the weight-file level and keeps the base model's files unchanged.
+- Artifacts: adapter in `checkpoints/router-sft-adapter/` (78 MB, local); merged model in `checkpoints/router-sft/` on the instance only. Eval traces: `evals/results/router_router_*_20261027_*.jsonl`.
 
 ## Working style
 

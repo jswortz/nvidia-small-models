@@ -109,4 +109,11 @@ for r in [route("refund", eligible), route("cancel", eligible), route("replaceme
     assert R.final_state(r) == agent_state, r
 ok("reward's decide-and-act matches the routed agent's store changes on 7 routes")
 
+# Regression: product search after a state check used to point at a deleted temp store.
+swap = {"id": "swap-1", "router_input": f"swap order {eligible} for the AeroBrew Coffee Maker", "group": "swap",
+        "expected_route": route("replacement", eligible, False, False, "AeroBrew Coffee Maker")}
+R.final_state(route("refund", eligible))
+assert R.reward(swap["expected_route"], swap) in (1.35, 0.35), R.reward(swap["expected_route"], swap)
+ok("new_product scoring still works after a state check")
+
 print(f"\nAll {passed} checks passed.")

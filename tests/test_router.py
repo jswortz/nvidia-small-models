@@ -87,4 +87,16 @@ route, _ = router.classify("Is 2025 the year returns changed?", FakeClient(reply
 assert route["order_id"] is None, route
 ok("backstop leaves policy questions without an order number")
 
+# Non-text values for new_product (seen from the base model with the short prompt) become None,
+# so product search never receives a boolean.
+for bad in (True, 0, "  "):
+    assert router.parse(json.dumps({"intent": "replacement", "new_product": bad}))["new_product"] is None, bad
+assert router.parse('{"intent": "replacement", "new_product": " Model X "}')["new_product"] == "Model X"
+ok("parse keeps only text for new_product")
+
+# The short prompt (for a fine-tuned router) lists every intent, and prompt_for picks it.
+assert all(i in router.SHORT_PROMPT for i in router.INTENTS)
+assert router.prompt_for("short") == router.SHORT_PROMPT and router.prompt_for("full") == router.ROUTER_PROMPT
+ok("short prompt names every intent; prompt_for selects it")
+
 print(f"\nAll {passed} checks passed.")
