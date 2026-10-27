@@ -58,6 +58,7 @@ training/reward.py        Phase 6: store-state reward (+1.0 state match, -2.0 ha
 training/build_sft_data.py, configs/router_peft.yaml, merge_lora.py   Phase 6 step 3: LoRA SFT with NeMo AutoModel, merge
 training/grpo/, configs/router_grpo.yaml   Phase 6 step 4: GRPO with NeMo RL v0.7.0; router_env.py wraps reward.py
 training/brev/            Scripts run on the rented GPU: run_sft.sh, run_grpo.sh, eval_router.sh
+docs/phase6_results.md    Phase 6 write-up. docs/interview_story.md: talk track and expected questions, with numbers from the runs
 tests/                    smoke_test.py (15 checks), test_policy_engine.py (21 checks), test_router.py (9 checks), test_multi_order.py (7 checks),
                           test_planner_fallback.py (7 checks), test_nat_profiling.py (5 checks), test_reward.py (10 checks),
                           test_eval_scoring.py (5 checks). Fake clients;
