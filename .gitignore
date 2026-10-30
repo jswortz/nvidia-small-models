@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+evals/results/
+.env
+checkpoints/
+training/output/
+results/
